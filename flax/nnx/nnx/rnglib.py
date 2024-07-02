@@ -28,11 +28,13 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import typing as tp
 
 import jax
 import jax.numpy as jnp
 
+from flax import struct
 from flax.nnx.nnx import graph
 from flax.nnx.nnx.state import State
 from flax.nnx.nnx.variables import Variable
@@ -40,6 +42,7 @@ from flax.nnx.nnx import filterlib
 from flax.nnx.nnx.filterlib import All
 from flax.nnx.nnx.object import Object
 
+F = tp.TypeVar('F', bound=tp.Callable[..., tp.Any])
 Counts = list[int]
 AxesValue = tp.Union[int, None]
 SplitPattern = tp.Union[AxesValue, tuple[AxesValue, ...]]
@@ -53,15 +56,13 @@ MISSING = Missing()
 
 
 class RngState(Variable[jax.Array]):
-  pass
-
-
-class RngCount(RngState):
   tag: str
 
 
-class RngKey(RngState):
-  tag: str
+class RngCount(RngState): ...
+
+
+class RngKey(RngState): ...
 
 
 NotKey = filterlib.All(RngState, filterlib.Not(RngKey))
@@ -277,15 +278,91 @@ def fork(
 
   return ForkStates(split_keys, split_counts, broadcast_keys, broadcast_counts)
 
+StreamBackup = (
+  tuple[RngStream, jax.Array, jax.Array] | tuple[RngStream, jax.Array]
+)
+
+class SplitBackups(struct.PyTreeNode, tp.Iterable[StreamBackup]):
+  backups: list[StreamBackup]
+
+  def __iter__(self) -> tp.Iterator[StreamBackup]:
+    return iter(self.backups)
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, *args):
+    restore_rngs(self)
+
+
+@tp.overload
+def split_rngs(
+  node: tp.Any,
+  /,
+  *,
+  splits: int | tuple[int | None, ...],
+  only: filterlib.Filter = ...,
+) -> SplitBackups: ...
+@tp.overload
+def split_rngs(
+  *,
+  splits: int | tuple[int | None, ...],
+  only: filterlib.Filter = ...,
+) -> tp.Callable[[F], F]: ...
+def split_rngs(
+  node: tp.Any = MISSING,
+  /,
+  *,
+  splits: int | tuple[int | None, ...],
+  only: filterlib.Filter = ...,
+) -> SplitBackups | tp.Callable[[F], F]:
+  if isinstance(node, Missing):
+
+    def split_rngs_decorator(f: F) -> F:
+      @functools.wraps(f)
+      def wrapper(*args, **kwargs):
+        backups = split_rngs((args, kwargs), splits=splits, only=only)
+        try:
+          return f(*args, **kwargs)
+        finally:
+          restore_rngs(backups)
+
+      return tp.cast(F, wrapper)
+
+    return split_rngs_decorator
+
+  predicate = filterlib.to_predicate(only)
+  _num_splits: int | tuple[int, ...]
+  if isinstance(splits, int):
+    _num_splits = splits
+  else:
+    _num_splits = tuple(x if x is not None else 1 for x in splits)
+  backups: list[StreamBackup] = []
+  for path, stream in graph.iter_graph(node):
+    if (
+      isinstance(stream, RngStream)
+      and predicate((*path, 'key'), stream.key)
+      and predicate((*path, 'count'), stream.count)
+    ):
+      key = stream()
+      backups.append((stream, stream.key.value, stream.count.value))
+      stream.key.value = jax.random.split(key, _num_splits)
+      stream.count.value = jnp.zeros(stream.key.value.shape, dtype=jnp.uint32)
+
+  return SplitBackups(backups)
+
 
 def backup_keys(node: tp.Any, /):
-  backups: list[tuple[RngStream, jax.Array]] = []
+  backups: list[StreamBackup] = []
   for _, stream in graph.iter_graph(node):
     if isinstance(stream, RngStream):
       backups.append((stream, stream.key.value))
   return backups
 
 
-def restore_keys(backups: list[tuple[RngStream, jax.Array]], /):
-  for stream, key in backups:
-    stream.key.value = key
+def restore_rngs(backups: tp.Iterable[StreamBackup], /):
+  for backup in backups:
+    stream = backup[0]
+    stream.key.value = backup[1]  # key
+    if len(backup) == 3:
+      stream.count.value = backup[2]  # count
